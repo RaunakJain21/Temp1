@@ -1,4 +1,323 @@
-# Temp1
+#TTTTTTemp1
+Temp1emp1emp1emp1emp1emp1"
+
+
+backend/server.js
+JavaScript
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+const XLSX = require("xlsx");
+const pool = require("./db");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const upload = multer();
+
+const getIP = (req) =>
+  req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+
+// ================= EXCEL UPLOAD =================
+app.post("/api/upload", upload.single("file"), async (req, res) => {
+  const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const data = XLSX.utils.sheet_to_json(sheet);
+
+  for (const row of data) {
+    const { sw_model, chip_name, form_factor, description } = row;
+
+    await pool.query(
+      `INSERT INTO hardware_summary 
+       (sw_model, chip_name, form_factor, description)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE sw_model=sw_model`,
+      [sw_model, chip_name, form_factor, description]
+    );
+
+    const teams = [
+      "Product PL","Memory","Performance",
+      "Release Management","Robustness","Test Farm/Soc"
+    ];
+
+    for (const t of teams) {
+      await pool.query(
+        `INSERT IGNORE INTO team_panel_data (sw_model, team_name)
+         VALUES (?, ?)`,
+        [sw_model, t]
+      );
+    }
+  }
+
+  res.send("Uploaded");
+});
+
+// ================= DASHBOARD =================
+app.get("/api/hardware", async (req, res) => {
+  const [rows] = await pool.query(`
+    SELECT h.*, 
+    COALESCE(SUM(t.atsc + t.dvb + t.isdb + t.aot),0) as existing_panels
+    FROM hardware_summary h
+    LEFT JOIN team_panel_data t ON h.sw_model = t.sw_model
+    GROUP BY h.sw_model
+  `);
+
+  res.json(rows);
+});
+
+// ================= LOCK =================
+app.post("/api/lock/:chip", async (req, res) => {
+  const chip = req.params.chip;
+  const ip = getIP(req);
+
+  const [lock] = await pool.query(
+    "SELECT * FROM chip_lock WHERE chip_name=?",
+    [chip]
+  );
+
+  if (lock.length)
+    return res.status(400).json({ by: lock[0].locked_by });
+
+  await pool.query(
+    "INSERT INTO chip_lock (chip_name, locked_by) VALUES (?,?)",
+    [chip, ip]
+  );
+
+  res.send("locked");
+});
+
+// ================= GET CHIP =================
+app.get("/api/chip/:chip", async (req, res) => {
+  const chip = req.params.chip;
+
+  const [summary] = await pool.query(
+    "SELECT * FROM hardware_summary WHERE chip_name=?",
+    [chip]
+  );
+
+  const [teams] = await pool.query(
+    `SELECT * FROM team_panel_data WHERE sw_model IN 
+     (SELECT sw_model FROM hardware_summary WHERE chip_name=?)`,
+    [chip]
+  );
+
+  res.json({ summary, teams });
+});
+
+// ================= SAVE =================
+app.post("/api/save/:chip", async (req, res) => {
+  const chip = req.params.chip;
+  const ip = getIP(req);
+  const { data } = req.body;
+
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    const [lock] = await conn.query(
+      "SELECT * FROM chip_lock WHERE chip_name=?",
+      [chip]
+    );
+
+    if (!lock.length || lock[0].locked_by !== ip)
+      throw new Error("Lock lost");
+
+    for (const row of data) {
+      await conn.query(
+        "UPDATE hardware_summary SET required_panels=? WHERE sw_model=?",
+        [row.required_panels, row.sw_model]
+      );
+
+      for (const t of row.teams) {
+        await conn.query(
+          `UPDATE team_panel_data 
+           SET atsc=?, dvb=?, isdb=?, aot=?, remarks=? 
+           WHERE id=?`,
+          [t.atsc, t.dvb, t.isdb, t.aot, t.remarks, t.id]
+        );
+      }
+    }
+
+    await conn.query("DELETE FROM chip_lock WHERE chip_name=?", [chip]);
+
+    await conn.commit();
+    res.send("Saved");
+  } catch (e) {
+    await conn.rollback();
+    res.status(400).send(e.message);
+  } finally {
+    conn.release();
+  }
+});
+
+app.listen(5000, () => console.log("Backend running"));
+🎨 4. FRONTEND SETUP
+📦 frontend/package.json
+JSON
+{
+  "name": "frontend",
+  "dependencies": {
+    "@mui/material": "^5.15.0",
+    "@mui/icons-material": "^5.15.0",
+    "axios": "^1.6.0",
+    "react-router-dom": "^6.0.0"
+  }
+}
+🔌 api.js
+JavaScript
+import axios from "axios";
+
+export default axios.create({
+  baseURL: "http://localhost:5000/api"
+});
+🧠 App.js
+JavaScript
+import { BrowserRouter, Routes, Route } from "react-router-dom";
+import Dashboard from "./components/Dashboard";
+import EditPage from "./components/EditPage";
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<Dashboard />} />
+        <Route path="/edit/:chip" element={<EditPage />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+📊 Dashboard.js
+JavaScript
+import { useEffect, useState } from "react";
+import api from "../services/api";
+import { Table, TableRow, TableCell, Button } from "@mui/material";
+import { useNavigate } from "react-router-dom";
+import ChipDialog from "./ChipDialog";
+
+export default function Dashboard() {
+  const [data, setData] = useState([]);
+  const [open, setOpen] = useState(false);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    api.get("/hardware").then(res => setData(res.data));
+  }, []);
+
+  const handleChip = async (chip) => {
+    try {
+      await api.post(`/lock/${chip}`);
+      navigate(`/edit/${chip}`);
+    } catch (e) {
+      alert("Locked by " + e.response.data.by);
+    }
+  };
+
+  return (
+    <div>
+      <Button onClick={()=>setOpen(true)}>Edit</Button>
+
+      <ChipDialog open={open} onSelect={handleChip} data={data}/>
+
+      <Table>
+        {data.map(r => (
+          <TableRow key={r.sw_model}>
+            <TableCell>{r.sw_model}</TableCell>
+            <TableCell>{r.chip_name}</TableCell>
+            <TableCell>{r.required_panels}</TableCell>
+            <TableCell>{r.existing_panels}</TableCell>
+            <TableCell>{r.required_panels - r.existing_panels}</TableCell>
+          </TableRow>
+        ))}
+      </Table>
+    </div>
+  );
+}
+🎯 ChipDialog.js
+JavaScript
+import { Dialog, Select, MenuItem, Button } from "@mui/material";
+import { useState } from "react";
+
+export default function ChipDialog({ open, data, onSelect }) {
+  const chips = [...new Set(data.map(d=>d.chip_name))];
+  const [chip, setChip] = useState("");
+
+  return (
+    <Dialog open={open}>
+      <Select value={chip} onChange={(e)=>setChip(e.target.value)}>
+        {chips.map(c => <MenuItem key={c}>{c}</MenuItem>)}
+      </Select>
+      <Button onClick={()=>onSelect(chip)}>Go</Button>
+    </Dialog>
+  );
+}
+✏️ EditPage.js
+JavaScript
+import { useEffect, useState } from "react";
+import api from "../services/api";
+import { useParams } from "react-router-dom";
+
+export default function EditPage() {
+  const { chip } = useParams();
+  const [data, setData] = useState([]);
+
+  useEffect(() => {
+    api.get(`/chip/${chip}`).then(res => {
+      const merged = res.data.summary.map(s => ({
+        ...s,
+        teams: res.data.teams.filter(t=>t.sw_model===s.sw_model)
+      }));
+      setData(merged);
+    });
+  }, [chip]);
+
+  const save = async () => {
+    await api.post(`/save/${chip}`, { data });
+    alert("Saved");
+  };
+
+  return (
+    <div>
+      <h2>{chip}</h2>
+
+      {data.map((row,i)=>(
+        <div key={row.sw_model}>
+          <h4>{row.sw_model}</h4>
+
+          <input
+            value={row.required_panels}
+            onChange={(e)=>{
+              const newData=[...data];
+              newData[i].required_panels=e.target.value;
+              setData(newData);
+            }}
+          />
+
+          {row.teams.map((t,j)=>(
+            <div key={t.id}>
+              {t.team_name}
+              <input onChange={(e)=>t.atsc=e.target.value}/>
+            </div>
+          ))}
+        </div>
+      ))}
+
+      <button onClick={save}>Save</button>
+    </div>
+  );
+}
+▶️ 5. HOW TO RUN
+Step 1: Backend
+Bash
+cd backend
+npm install
+node server.js
+Step 2: Frontend
+Bash
+cd frontend
+npm install
+npm start
 
 import * as Tabs from "@radix-ui/react-tabs"
 import { useEffect, useState } from "react"
